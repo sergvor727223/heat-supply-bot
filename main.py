@@ -22,6 +22,9 @@ from config import (
     PORT
 )
 
+# Импортируем системный промпт
+from system_prompt import SYSTEM_PROMPT
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -188,6 +191,32 @@ async def search_google_for_ot(query: str, session: ClientSession):
         logger.error(f"Ошибка при поиске в Google: {e}")
         return None
 
+
+# -----------------------------------------------------------------------------
+# Функция обёртка для общения с OpenAI (ChatCompletion)
+# -----------------------------------------------------------------------------
+async def get_openai_answer(user_query: str) -> str:
+    """
+    Вызывает OpenAI ChatCompletion с system_prompt.
+    user_query — сообщение пользователя (или уже сформированный текст).
+    Возвращает текст ответа.
+    """
+    try:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_query}
+        ]
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            max_tokens=1000
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Ошибка при обращении к OpenAI: {e}")
+        return "Извините, произошла ошибка при генерации ответа."
+
+
 # -----------------------------------------------------------------------------
 # 4. Хендлеры
 # -----------------------------------------------------------------------------
@@ -221,13 +250,22 @@ async def handle_query(message: Message) -> None:
     found_doc = find_in_local_docs(user_text)
     if found_doc:
         doc_num, doc_title, snippet = found_doc
-        response_text = (
-            f"Нашёл ответ в локальной базе:\n\n"
-            f"Документ: {doc_title} ({doc_num})\n\n"
-            f"{snippet}"
+
+        # Формируем текст, который отдадим OpenAI: чтобы соблюсти стиль system_prompt,
+        # мы даём ему контекст из snippet и номер документа.
+        # Можно сформировать user_message, где описываем, что нашли:
+        combined_text = (
+            f"Пользователь спросил: '{user_text}'.\n"
+            f"В локальной базе найден документ: {doc_title} ({doc_num}).\n"
+            f"Выдержка:\n{snippet}\n\n"
+            f"Сформулируй профессиональный и дружелюбный ответ."
         )
-        await message.answer(response_text)
-        await send_log_to_telegram(user_info, user_text, response_text)
+
+        # Теперь вызываем OpenAI, чтобы оно красиво сформулировало ответ.
+        final_answer = await get_openai_answer(combined_text)
+
+        await message.answer(final_answer)
+        await send_log_to_telegram(user_info, user_text, final_answer)
         return
 
     # 2) если не нашли -> сообщаем и идём на КонсультантПлюс
@@ -272,14 +310,19 @@ async def handle_judicial_yes(message: Message):
             await send_log_to_telegram(user_info, user_text, not_found_text)
             return
 
-        response_text = (
-            f"Вот что удалось найти:\n\n"
+        # Сформируем текст для OpenAI
+        combined_text = (
+            f"Пользователь спрашивал: 'судебная практика по охране труда'.\n"
+            f"Найдена информация:\n"
             f"Название: {result['title']}\n"
-            f"Ссылка: {result['link']}\n\n"
-            f"{result['excerpt']}"
+            f"Ссылка: {result['link']}\n"
+            f"Краткое описание: {result['excerpt']}\n\n"
+            "Сформулируй ответ в профессиональном и дружелюбном стиле, обязательно укажи ссылку."
         )
-        await message.answer(response_text)
-        await send_log_to_telegram(user_info, user_text, response_text)
+        final_answer = await get_openai_answer(combined_text)
+
+        await message.answer(final_answer)
+        await send_log_to_telegram(user_info, user_text, final_answer)
 
     except Exception as e:
         error_message = f"Произошла ошибка при поиске судебной практики: {e}"
@@ -315,14 +358,18 @@ async def handle_judicial_no(message: Message):
             await send_log_to_telegram(user_info, user_text, not_found_text)
             return
 
-        response_text = (
-            f"Вот что удалось найти:\n\n"
+        combined_text = (
+            f"Пользователь спрашивал: 'охрана труда'.\n"
+            f"Найдена информация:\n"
             f"Название: {result['title']}\n"
-            f"Ссылка: {result['link']}\n\n"
-            f"{result['excerpt']}"
+            f"Ссылка: {result['link']}\n"
+            f"Описание: {result['excerpt']}\n\n"
+            "Подготовь краткий ответ в профессиональном и дружелюбном стиле, укажи ссылку."
         )
-        await message.answer(response_text)
-        await send_log_to_telegram(user_info, user_text, response_text)
+        final_answer = await get_openai_answer(combined_text)
+
+        await message.answer(final_answer)
+        await send_log_to_telegram(user_info, user_text, final_answer)
 
     except Exception as e:
         error_message = f"Ошибка при поиске в интернете: {e}"
@@ -347,7 +394,7 @@ async def on_startup(bot: Bot) -> None:
         try:
             await log_bot.send_message(
                 LOG_CHAT_ID,
-                f"🚀 Бот по охране труда запущен (с реальным поиском)\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"🚀 Бот по охране труда запущен (с реальным поиском + system_prompt)\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
         except Exception as e:
             logger.error(f"Ошибка уведомления при старте: {e}")
@@ -371,9 +418,6 @@ async def on_shutdown(bot: Bot) -> None:
     await bot.session.close()
 
 def main() -> None:
-    from aiohttp import web
-    from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     app.router.add_get("/", lambda request: web.Response(text="OK"))
