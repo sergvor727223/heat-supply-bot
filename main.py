@@ -40,25 +40,24 @@ router = Router()
 dp.include_router(router)
 
 # -----------------------------------------------------------------------------
-# 2. Пример БАЗЫ ЗНАНИЙ (тестовый словарь DOCS_DB)
+# 2. Тестовая локальная база знаний (DOCS_DB)
 # -----------------------------------------------------------------------------
-# Для тестирования используется словарь, в будущем можно заменить на SQL-запросы к реальной базе.
 DOCS_DB = {
     "ГОСТ 12.0.004-2015": {
         "title": "ГОСТ 12.0.004-2015 Организация обучения безопасности труда",
         "text": (
-            "Этот стандарт устанавливает основные требования к обучению охране труда "
-            "для работников различных отраслей. Здесь описаны методы обучения и требования к квалификации инструкторов."
+            "Этот стандарт устанавливает основные требования к обучению охране труда для работников различных отраслей. "
+            "Здесь описаны методы обучения и требования к квалификации инструкторов."
         )
     },
     "Приказ Минтруда №59н": {
         "title": "Приказ Министерства труда и соцзащиты №59н",
         "text": (
             "В данном приказе регламентируются методики проверки знаний сотрудников по безопасности и охране труда. "
-            "Описаны процедуры проведения инструктажей и обучение новых работников."
+            "Описаны процедуры проведения инструктажей и обучения новых работников."
         )
     },
-    # Добавляйте другие документы по необходимости.
+    # Дополните по необходимости
 }
 
 # -----------------------------------------------------------------------------
@@ -69,7 +68,7 @@ async def send_log_to_telegram(user_info: str, user_message: str, bot_response: 
     """
     Отправка лога в LogBot.
     """
-    from aiogram import Bot  # Локальный импорт, чтобы не пересекался с основным bot
+    from aiogram import Bot  # локальный импорт
     log_message = (
         f"👤 Пользователь: {user_info}\n"
         f"⏰ Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -87,8 +86,8 @@ async def send_log_to_telegram(user_info: str, user_message: str, bot_response: 
 
 def find_in_local_docs(query: str):
     """
-    Простой поиск по словарю DOCS_DB.
-    Возвращает (doc_number, title, snippet) или None, если совпадение не найдено.
+    Поиск по тестовому словарю DOCS_DB.
+    Если найден документ, возвращает (doc_number, title, snippet), иначе None.
     """
     query_lower = query.lower()
     for doc_number, doc_data in DOCS_DB.items():
@@ -102,7 +101,6 @@ def find_in_local_docs(query: str):
 async def search_consultantplus(query: str, session: ClientSession):
     """
     Поиск на сайте consultant.ru по заданному запросу.
-    Если результаты не найдены по первичному селектору, пробуем альтернативный.
     """
     base_url = "https://www.consultant.ru/search/"
     params = {"query": query}
@@ -114,20 +112,16 @@ async def search_consultantplus(query: str, session: ClientSession):
 
             html = await resp.text()
             soup = BeautifulSoup(html, "html.parser")
-
-            # Пытаемся найти результаты по первичному селектору
             results = soup.find_all("div", class_="search-card")
             if not results:
                 results = soup.find_all("div", class_="result")
             if not results:
                 return None
-
             first_result = results[0]
             title_el = first_result.find("a")
             excerpt_el = first_result.find("div")
             if not title_el or not excerpt_el:
                 return None
-
             title = title_el.get_text(strip=True)
             link = title_el.get("href", "")
             excerpt = excerpt_el.get_text(strip=True)
@@ -140,8 +134,7 @@ async def search_consultantplus(query: str, session: ClientSession):
 
 async def search_google_for_ot(query: str, session: ClientSession):
     """
-    Поиск через Google с ограничением site:consultant.ru.
-    Для реального проекта рекомендуется использовать официальный API.
+    Поиск через Google с ограничением на сайт consultant.ru.
     """
     google_url = "https://www.google.com/search"
     params = {"q": f"{query} site:consultant.ru", "hl": "ru"}
@@ -156,7 +149,6 @@ async def search_google_for_ot(query: str, session: ClientSession):
             if resp.status != 200:
                 logger.warning(f"Google вернул статус {resp.status}")
                 return None
-
             html = await resp.text()
             soup = BeautifulSoup(html, "html.parser")
             divs = soup.select("div.tF2Cxc")
@@ -195,151 +187,87 @@ async def get_openai_answer(user_query: str) -> str:
         return "Извините, произошла ошибка при генерации ответа."
 
 # -----------------------------------------------------------------------------
-# 4. Хендлеры
+# 4. Основной обработчик запросов
 # -----------------------------------------------------------------------------
-
 @router.message(CommandStart())
 async def command_start(message: Message) -> None:
     welcome_text = (
-        "Привет! Я бот-консультант по охране труда. Задайте свой вопрос, и я поищу ответ "
-        "в своей локальной базе. Если не найду, обращусь к КонсультантПлюс. Всегда указываю номер и название документа или ссылку на источник!"
+        "Привет! Я бот-консультант по охране труда. Задайте свой вопрос, и я постараюсь найти ответ "
+        "в своей локальной базе. Если нужной информации нет, я выполню поиск в интернете и обязательно укажу источник. "
+        "Я не выдумываю ответы — всегда предоставляю только проверенную информацию."
     )
     await message.answer(welcome_text)
-    user_info = (f"{message.from_user.full_name} (@{message.from_user.username})" 
+    user_info = (f"{message.from_user.full_name} (@{message.from_user.username})"
                  if message.from_user.username else message.from_user.full_name)
     await send_log_to_telegram(user_info, "/start", welcome_text)
 
 @router.message(F.text)
 async def handle_query(message: Message) -> None:
     user_text = message.text.strip()
-    user_info = (f"{message.from_user.full_name} (@{message.from_user.username})" 
+    user_info = (f"{message.from_user.full_name} (@{message.from_user.username})"
                  if message.from_user.username else message.from_user.full_name)
+
+    # Если запрос содержит слова "судеб" и "практик", выполняем специальный поиск по судебной практике,
+    # используя текст запроса пользователя
+    if "судеб" in user_text.lower() and "практик" in user_text.lower():
+        async with ClientSession() as session:
+            result = await search_google_for_ot(user_text, session)
+        if result:
+            answer = (
+                f"Найдена информация по вашему запросу о судебной практике:\n"
+                f"Название: {result['title']}\n"
+                f"Ссылка: {result['link']}\n"
+                f"Описание: {result['excerpt']}"
+            )
+        else:
+            answer = "Извините, не удалось найти информацию по судебной практике по вашему запросу."
+        await message.answer(answer)
+        await send_log_to_telegram(user_info, user_text, answer)
+        return
 
     # 1) Поиск в локальной базе (тестовый словарь)
     found_doc = find_in_local_docs(user_text)
     if found_doc:
         doc_num, doc_title, snippet = found_doc
-        combined_text = (
-            f"Пользователь спросил: '{user_text}'.\n"
-            f"В локальной базе найден документ: {doc_title} ({doc_num}).\n"
-            f"Выдержка:\n{snippet}\n\n"
-            "Сформулируй профессиональный и дружелюбный ответ."
+        answer = (
+            f"Найден документ в локальной базе:\n"
+            f"Документ: {doc_title} ({doc_num})\n"
+            f"Выдержка: {snippet}"
         )
-        final_answer = await get_openai_answer(combined_text)
-        await message.answer(final_answer)
-        await send_log_to_telegram(user_info, user_text, final_answer)
+        await message.answer(answer)
+        await send_log_to_telegram(user_info, user_text, answer)
         return
 
-    # 2) Если локальная база не содержит данных
-    no_local_text = (
-        "В моей локальной базе знаний ответа нет. Сейчас попробую найти информацию на сайте КонсультантПлюс."
-    )
-    await message.answer(no_local_text)
-    await send_log_to_telegram(user_info, user_text, no_local_text)
-
-    # 2.1) Спрашиваем, нужна ли судебная практика
-    question_text = (
-        "Нужна ли по вашему запросу судебная практика? Напишите 'да, судебная практика' или 'нет, достаточно'."
-    )
-    await message.answer(question_text)
-
-@router.message(lambda msg: "да" in msg.text.lower() and "судеб" in msg.text.lower())
-async def handle_judicial_yes(message: Message):
-    user_text = message.text.strip()
-    user_info = (f"{message.from_user.full_name} (@{message.from_user.username})" 
-                 if message.from_user.username else message.from_user.full_name)
-
-    note_text = "Ищу судебную практику по охране труда на consultant.ru ..."
-    await message.answer(note_text)
-    await send_log_to_telegram(user_info, user_text, note_text)
-
-    try:
-        async with ClientSession() as session:
-            result = await search_consultantplus("судебная практика по охране труда", session)
-            if not result:
-                result = await search_google_for_ot("судебная практика по охране труда", session)
-            if not result:
-                not_found_text = (
-                    "К сожалению, не удалось получить результаты по судебной практике. "
-                    "Возможно, сайт недоступен или требуется дополнительная авторизация."
-                )
-                await message.answer(not_found_text)
-                await send_log_to_telegram(user_info, user_text, not_found_text)
-                return
-
-            combined_text = (
-                f"Пользователь спрашивал: 'судебная практика по охране труда'.\n"
-                f"Найдена информация:\n"
-                f"Название: {result['title']}\n"
-                f"Ссылка: {result['link']}\n"
-                f"Описание: {result['excerpt']}\n\n"
-                "Сформулируй ответ в профессиональном и дружелюбном стиле, обязательно укажи ссылку."
-            )
-            final_answer = await get_openai_answer(combined_text)
-            await message.answer(final_answer)
-            await send_log_to_telegram(user_info, user_text, final_answer)
-    except Exception as e:
-        error_message = f"Произошла ошибка при поиске судебной практики: {e}"
-        await message.answer(error_message)
-        logger.error(error_message)
-        await send_log_to_telegram(user_info, user_text, error_message)
-
-@router.message(lambda msg: "нет" in msg.text.lower() and "судеб" in msg.text.lower())
-async def handle_judicial_no(message: Message):
-    user_text = message.text.strip()
-    user_info = (f"{message.from_user.full_name} (@{message.from_user.username})" 
-                 if message.from_user.username else message.from_user.full_name)
-
-    note_text = "Окей, без судебной практики. Ищу информацию через Google по вашему запросу..."
-    await message.answer(note_text)
-    await send_log_to_telegram(user_info, user_text, note_text)
-
-    try:
-        async with ClientSession() as session:
-            result = await search_google_for_ot(user_text, session)
-            if not result:
-                not_found_text = (
-                    "Не удалось найти результаты по вашему запросу через Google. "
-                    "Возможно, ничего не найдено или парсинг блокируется."
-                )
-                await message.answer(not_found_text)
-                await send_log_to_telegram(user_info, user_text, not_found_text)
-                return
-
-            combined_text = (
-                f"Пользователь спрашивал: '{user_text}'.\n"
-                f"Найдена информация:\n"
-                f"Название: {result['title']}\n"
-                f"Ссылка: {result['link']}\n"
-                f"Описание: {result['excerpt']}\n\n"
-                "Подготовь краткий ответ в профессиональном и дружелюбном стиле, укажи ссылку."
-            )
-            final_answer = await get_openai_answer(combined_text)
-            await message.answer(final_answer)
-            await send_log_to_telegram(user_info, user_text, final_answer)
-    except Exception as e:
-        error_message = f"Ошибка при поиске в интернете: {e}"
-        await message.answer(error_message)
-        logger.error(error_message)
-        await send_log_to_telegram(user_info, user_text, error_message)
+    # 2) Если локальная база не содержит данных, ищем в интернете по общему запросу
+    async with ClientSession() as session:
+        result = await search_google_for_ot(user_text, session)
+    if result:
+        answer = (
+            f"Найдена информация из интернета:\n"
+            f"Название: {result['title']}\n"
+            f"Ссылка: {result['link']}\n"
+            f"Описание: {result['excerpt']}"
+        )
+    else:
+        answer = "Извините, не удалось найти информацию в интернете по вашему запросу."
+    await message.answer(answer)
+    await send_log_to_telegram(user_info, user_text, answer)
 
 # -----------------------------------------------------------------------------
 # 5. Жизненный цикл приложения (webhook, запуск)
 # -----------------------------------------------------------------------------
-
 async def on_startup(bot: Bot) -> None:
     if WEBHOOK_URL:
         webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
         logger.info(f"Устанавливаю вебхук: {webhook_url}")
         await bot.set_webhook(webhook_url)
         
-        # Лог запуска
         from aiogram import Bot
         log_bot = Bot(token=LOG_BOT_TOKEN)
         try:
             await log_bot.send_message(
                 LOG_CHAT_ID,
-                f"🚀 Бот по охране труда запущен (с реальным поиском + system_prompt)\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"🚀 Бот по охране труда запущен\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
         except Exception as e:
             logger.error(f"Ошибка уведомления при старте: {e}")
