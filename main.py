@@ -192,9 +192,9 @@ async def get_openai_answer(user_query: str) -> str:
 @router.message(CommandStart())
 async def command_start(message: Message) -> None:
     welcome_text = (
-        "Привет! Я бот-консультант по охране труда. Задайте свой вопрос, и я постараюсь найти ответ "
+        "Привет! Я Алина, консультант по охране труда. Задайте свой вопрос, и я постараюсь найти ответ "
         "в своей локальной базе. Если нужной информации нет, я выполню поиск в интернете и обязательно укажу источник. "
-        "Я не выдумываю ответы — всегда предоставляю только проверенную информацию."
+        "Я всегда предоставляю только проверенную информацию."
     )
     await message.answer(welcome_text)
     user_info = (f"{message.from_user.full_name} (@{message.from_user.username})"
