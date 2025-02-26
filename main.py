@@ -11,6 +11,13 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web, ClientSession
 from bs4 import BeautifulSoup
 
+# Настраиваем более подробное логирование
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Импортируем настройки из config.py
 from config import (
     TELEGRAM_TOKEN,
@@ -24,9 +31,6 @@ from config import (
 
 # Импортируем системный промпт
 from system_prompt import SYSTEM_PROMPT
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Устанавливаем ключ OpenAI
 openai.api_key = OPENAI_API_KEY
@@ -89,45 +93,70 @@ def find_in_local_docs(query: str):
     Поиск по тестовому словарю DOCS_DB.
     Если найден документ, возвращает (doc_number, title, snippet), иначе None.
     """
+    logger.info(f"Ищем в локальной базе: {query}")
     query_lower = query.lower()
     for doc_number, doc_data in DOCS_DB.items():
         full_text_lower = doc_data["text"].lower()
         title_lower = doc_data["title"].lower()
         if query_lower in full_text_lower or query_lower in title_lower:
             snippet = doc_data["text"][:300] + "..."
+            logger.info(f"Найден документ в локальной базе: {doc_number}")
             return (doc_number, doc_data["title"], snippet)
+    logger.info("В локальной базе информация не найдена")
     return None
 
 async def search_consultantplus(query: str, session: ClientSession):
     """
     Поиск на сайте consultant.ru по заданному запросу.
     """
+    logger.info(f"Ищем на consultant.ru: {query}")
     base_url = "https://www.consultant.ru/search/"
     params = {"query": query}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.consultant.ru/"
+    }
     try:
-        async with session.get(base_url, params=params) as resp:
+        async with session.get(base_url, params=params, headers=headers, timeout=15) as resp:
             if resp.status != 200:
                 logger.warning(f"ConsultantPlus вернул статус {resp.status}")
                 return None
 
             html = await resp.text()
+            logger.info(f"Получен ответ от ConsultantPlus, размер HTML: {len(html)}")
+            
             soup = BeautifulSoup(html, "html.parser")
-            results = soup.find_all("div", class_="search-card")
-            if not results:
-                results = soup.find_all("div", class_="result")
-            if not results:
-                return None
-            first_result = results[0]
-            title_el = first_result.find("a")
-            excerpt_el = first_result.find("div")
-            if not title_el or not excerpt_el:
-                return None
-            title = title_el.get_text(strip=True)
-            link = title_el.get("href", "")
-            excerpt = excerpt_el.get_text(strip=True)
-            if link.startswith("/"):
-                link = "https://www.consultant.ru" + link
-            return {"title": title, "link": link, "excerpt": excerpt}
+            
+            # Пробуем различные селекторы, так как структура сайта может меняться
+            selectors = ["div.search-card", "div.result", "div.content-selection__item"]
+            
+            for selector in selectors:
+                results = soup.select(selector)
+                if results:
+                    first_result = results[0]
+                    
+                    # Ищем заголовок и ссылку разными способами
+                    title_el = first_result.find("a") or first_result.select_one("h3 a") or first_result.select_one(".title a")
+                    excerpt_el = first_result.find("div", class_="text") or first_result.select_one("p") or first_result.select_one(".snippet")
+                    
+                    if title_el:
+                        title = title_el.get_text(strip=True)
+                        link = title_el.get("href", "")
+                        excerpt = excerpt_el.get_text(strip=True) if excerpt_el else "Описание отсутствует"
+                        
+                        if link.startswith("/"):
+                            link = "https://www.consultant.ru" + link
+                            
+                        logger.info(f"Найден результат на ConsultantPlus: {title}")
+                        return {"title": title, "link": link, "excerpt": excerpt}
+            
+            logger.warning("Не удалось извлечь результаты поиска ConsultantPlus")
+            return None
     except Exception as e:
         logger.error(f"Ошибка при поиске на consultant.ru: {e}")
         return None
@@ -136,33 +165,54 @@ async def search_google_for_ot(query: str, session: ClientSession):
     """
     Поиск через Google с ограничением на сайт consultant.ru.
     """
+    logger.info(f"Ищем через Google: {query}")
     google_url = "https://www.google.com/search"
-    params = {"q": f"{query} site:consultant.ru", "hl": "ru"}
+    params = {"q": f"{query} site:consultant.ru охрана труда", "hl": "ru", "num": "5"}
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-        )
+            "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.google.com/"
     }
     try:
-        async with session.get(google_url, params=params, headers=headers) as resp:
+        async with session.get(google_url, params=params, headers=headers, timeout=15) as resp:
             if resp.status != 200:
                 logger.warning(f"Google вернул статус {resp.status}")
                 return None
+                
             html = await resp.text()
+            logger.info(f"Получен ответ от Google, размер HTML: {len(html)}")
+            
             soup = BeautifulSoup(html, "html.parser")
-            divs = soup.select("div.tF2Cxc")
-            if not divs:
-                return None
-            first = divs[0]
-            link_tag = first.select_one("a")
-            snippet_tag = first.select_one(".VwiC3b")
-            if not link_tag or not snippet_tag:
-                return None
-            title = link_tag.get_text(strip=True)
-            link = link_tag.get("href", "")
-            excerpt = snippet_tag.get_text(strip=True)
-            return {"title": title, "link": link, "excerpt": excerpt}
+            
+            # Пробуем разные селекторы, так как Google может менять структуру страницы
+            selectors = ["div.tF2Cxc", "div.g", "div.yuRUbf", "div.Gx5Zad"]
+            
+            for selector in selectors:
+                divs = soup.select(selector)
+                if divs:
+                    for div in divs:
+                        link_tag = div.select_one("a") or div.find("a")
+                        title_tag = div.select_one("h3") or div.find("h3")
+                        snippet_tag = div.select_one(".VwiC3b") or div.select_one(".st")
+                        
+                        if link_tag and (title_tag or link_tag.get_text(strip=True)):
+                            title = title_tag.get_text(strip=True) if title_tag else link_tag.get_text(strip=True)
+                            link = link_tag.get("href", "")
+                            excerpt = snippet_tag.get_text(strip=True) if snippet_tag else "Описание отсутствует"
+                            
+                            # Очистка URL от мусора
+                            if "url=" in link:
+                                link = link.split("url=")[1].split("&")[0]
+                            
+                            logger.info(f"Найден результат через Google: {title}")
+                            return {"title": title, "link": link, "excerpt": excerpt}
+                            
+            logger.warning("Не удалось извлечь результаты поиска Google")
+            return None
     except Exception as e:
         logger.error(f"Ошибка при поиске в Google: {e}")
         return None
@@ -171,6 +221,7 @@ async def get_openai_answer(user_query: str) -> str:
     """
     Вызывает OpenAI ChatCompletion с системным промптом.
     """
+    logger.info(f"Запрашиваем ответ у OpenAI: {user_query[:50]}...")
     try:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -181,6 +232,7 @@ async def get_openai_answer(user_query: str) -> str:
             messages=messages,
             max_tokens=1000
         )
+        logger.info("Получен ответ от OpenAI")
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Ошибка при обращении к OpenAI: {e}")
@@ -207,23 +259,32 @@ async def handle_query(message: Message) -> None:
     user_info = (f"{message.from_user.full_name} (@{message.from_user.username})"
                  if message.from_user.username else message.from_user.full_name)
 
+    # Отправим уведомление пользователю, что обрабатываем запрос
+    await message.answer("Ищу информацию по вашему запросу...")
+    logger.info(f"Получен запрос от {user_info}: {user_text}")
+
     # Если запрос содержит слова "судеб" и "практик", выполняем специальный поиск по судебной практике,
     # используя текст запроса пользователя
     if "судеб" in user_text.lower() and "практик" in user_text.lower():
-        async with ClientSession() as session:
-            result = await search_google_for_ot(user_text, session)
-        if result:
-            answer = (
-                f"Найдена информация по вашему запросу о судебной практике:\n"
-                f"Название: {result['title']}\n"
-                f"Ссылка: {result['link']}\n"
-                f"Описание: {result['excerpt']}"
-            )
-        else:
-            answer = "Извините, не удалось найти информацию по судебной практике по вашему запросу."
-        await message.answer(answer)
-        await send_log_to_telegram(user_info, user_text, answer)
-        return
+        logger.info("Обнаружен запрос по судебной практике")
+        try:
+            async with ClientSession() as session:
+                result = await search_google_for_ot(user_text, session)
+            if result:
+                answer = (
+                    f"Найдена информация по вашему запросу о судебной практике:\n"
+                    f"Название: {result['title']}\n"
+                    f"Ссылка: {result['link']}\n"
+                    f"Описание: {result['excerpt']}"
+                )
+            else:
+                answer = "Извините, не удалось найти информацию по судебной практике по вашему запросу."
+            await message.answer(answer)
+            await send_log_to_telegram(user_info, user_text, answer)
+            return
+        except Exception as e:
+            logger.error(f"Ошибка при поиске судебной практики: {e}")
+            # Продолжаем выполнение - переходим к обычному поиску
 
     # 1) Поиск в локальной базе (тестовый словарь)
     found_doc = find_in_local_docs(user_text)
@@ -238,18 +299,35 @@ async def handle_query(message: Message) -> None:
         await send_log_to_telegram(user_info, user_text, answer)
         return
 
-    # 2) Если локальная база не содержит данных, ищем в интернете по общему запросу
-    async with ClientSession() as session:
-        result = await search_google_for_ot(user_text, session)
-    if result:
-        answer = (
-            f"Найдена информация из интернета:\n"
-            f"Название: {result['title']}\n"
-            f"Ссылка: {result['link']}\n"
-            f"Описание: {result['excerpt']}"
-        )
-    else:
-        answer = "Извините, не удалось найти информацию в интернете по вашему запросу."
+    # 2) Если локальная база не содержит данных, ищем в интернете
+    try:
+        async with ClientSession() as session:
+            # Сначала пробуем искать на consultant.ru напрямую
+            result = await search_consultantplus(user_text, session)
+            
+            # Если на consultant.ru не нашли, пробуем Google
+            if not result:
+                logger.info("Прямой поиск на consultant.ru не дал результатов, пробуем Google")
+                # Небольшая задержка между запросами
+                await asyncio.sleep(1)
+                result = await search_google_for_ot(user_text, session)
+            
+            if result:
+                answer = (
+                    f"Найдена информация из интернета:\n"
+                    f"Название: {result['title']}\n"
+                    f"Ссылка: {result['link']}\n"
+                    f"Описание: {result['excerpt']}"
+                )
+            else:
+                # 3) Если ни в локальной базе, ни в интернете не найдено, используем OpenAI
+                logger.info("Поиск в интернете не дал результатов, обращаемся к OpenAI")
+                answer = await get_openai_answer(user_text)
+                answer = f"На основе доступной информации:\n\n{answer}\n\nОбратите внимание: информация предоставлена ИИ на основе общих знаний и требует проверки."
+    except Exception as e:
+        logger.error(f"Ошибка при поиске: {e}")
+        answer = "Извините, произошла ошибка при обработке запроса. Попробуйте позже или переформулируйте вопрос."
+    
     await message.answer(answer)
     await send_log_to_telegram(user_info, user_text, answer)
 
