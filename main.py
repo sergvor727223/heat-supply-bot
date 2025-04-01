@@ -1,6 +1,7 @@
 import logging
 import asyncio
 from datetime import datetime
+import os
 
 import openai
 from aiogram import Bot, Dispatcher, Router, types, F
@@ -10,6 +11,8 @@ from aiogram.types import Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web, ClientSession
 from bs4 import BeautifulSoup
+import re
+from docx import Document
 
 from config import (
     TELEGRAM_TOKEN,
@@ -33,47 +36,58 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ----- ПАМЯТЬ ДИАЛОГА (В ОПЕРАТИВКЕ) -----
-# user_context[user_id] = [
-#    {"role": "assistant"/"user"/"system", "content": "..."},
-#    ...
-# ]
 user_context = {}
 
-# ----- Пример локальной базы (тест) -----
-DOCS_DB = {
-    "ГОСТ 12.0.004-2015": {
-        "title": "ГОСТ 12.0.004-2015 Организация обучения безопасности труда",
-        "text": (
-            "Этот стандарт устанавливает основные требования к обучению охране труда "
-            "для работников различных отраслей. Здесь описаны методы обучения и требования к квалификации инструкторов."
-        )
-    },
-    "Приказ Минтруда №59н": {
-        "title": "Приказ Министерства труда и соцзащиты №59н",
-        "text": (
-            "В данном приказе регламентируются методики проверки знаний сотрудников по безопасности и охране труда. "
-            "Описаны процедуры проведения инструктажей и обучения новых работников."
-        )
-    },
+DOCUMENT_ALIASES = {
+    "жк рф": "Жилищный кодекс Российской Федерации",
+    "жилищный кодекс": "Жилищный кодекс Российской Федерации",
+    "жк": "Жилищный кодекс Российской Федерации",
+    "пп 290": "Постановление Правительства РФ от 03.04.2013 № 290",
+    "постановление 290": "Постановление Правительства РФ от 03.04.2013 № 290",
+    "пп рф 290": "Постановление Правительства РФ от 03.04.2013 № 290",
+    "290": "Постановление Правительства РФ от 03.04.2013 № 290",
+    "постановление 354": "Постановление Правительства РФ от 06.05.2011 № 354",
+    "пп 354": "Постановление Правительства РФ от 06.05.2011 № 354",
+    "354": "Постановление Правительства РФ от 06.05.2011 № 354",
+    "постановление 808": "Постановление Правительства РФ от 13.08.2006 № 808",
+    "пп 808": "Постановление Правительства РФ от 13.08.2006 № 808",
+    "808": "Постановление Правительства РФ от 13.08.2006 № 808",
+    "о приборах учета": "Постановление Правительства РФ от 06.05.2011 № 354",
+    "об оплате отопления": "Постановление Правительства РФ от 06.05.2011 № 354"
 }
 
-async def send_log_to_telegram(user_info: str, user_message: str, bot_response: str) -> None:
-    from aiogram import Bot
-    log_message = (
-        f"👤 Пользователь: {user_info}\n"
-        f"⏰ Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        f"📥 Запрос:\n{user_message}\n\n"
-        f"📤 Ответ:\n{bot_response}"
-    )
-    log_bot = Bot(token=LOG_BOT_TOKEN)
-    try:
-        await log_bot.send_message(LOG_CHAT_ID, log_message)
-        logger.info(f"Лог отправлен: {user_info}")
-    except Exception as e:
-        logger.error(f"Ошибка при отправке лога: {e}")
-    finally:
-        await log_bot.session.close()
+DOCS_DB = {}
+
+def load_documents_from_docs_folder(folder_path="docs"):
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".docx"):
+            try:
+                doc = Document(os.path.join(folder_path, filename))
+                full_text = "\n".join([p.text for p in doc.paragraphs])
+                DOCS_DB[filename] = {
+                    "title": filename,
+                    "text": full_text
+                }
+                logger.info(f"Загружен документ: {filename}")
+            except Exception as e:
+                logger.warning(f"Ошибка при чтении {filename}: {e}")
+
+
+def normalize_query(query: str) -> str:
+    q = query.lower()
+    for alias, full_name in DOCUMENT_ALIASES.items():
+        if alias in q:
+            q = q.replace(alias, full_name)
+    return q
+
+def infer_document_name_from_context(text: str) -> str:
+    if re.search(r'оплата.*отоплен', text, re.IGNORECASE):
+        return "Постановление Правительства РФ от 06.05.2011 № 354"
+    if re.search(r'прибор.*учета', text, re.IGNORECASE):
+        return "Постановление Правительства РФ от 06.05.2011 № 354"
+    if re.search(r'ответственность.*управляющей|жк', text, re.IGNORECASE):
+        return "Жилищный кодекс Российской Федерации"
+    return text
 
 def find_in_local_docs(query: str):
     query_lower = query.lower()
@@ -99,8 +113,6 @@ async def search_google(query: str, session: ClientSession):
                 return None
             html = await resp.text()
             soup = BeautifulSoup(html, "html.parser")
-            
-            # Ищем первый результат
             divs = soup.select("div.tF2Cxc, div.g")
             if not divs:
                 return None
@@ -118,11 +130,6 @@ async def search_google(query: str, session: ClientSession):
         return None
 
 async def call_openai_chat(context_messages):
-    """
-    Вызывает OpenAI ChatCompletion с system_prompt + контекстом (context_messages).
-    context_messages - это список словарей вида:
-      [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": ...}, ...]
-    """
     try:
         response = await openai.ChatCompletion.acreate(
             model="gpt-3.5-turbo",
@@ -137,63 +144,42 @@ async def call_openai_chat(context_messages):
 @router.message(CommandStart())
 async def command_start(message: Message) -> None:
     welcome_text = (
-        "Привет! Я Алина, консультант по охране труда. Задавай вопросы, и я постараюсь найти ответ "
-        "в своей локальной базе или в интернете, обязательно укажу источник. "
-        "Я не выдумываю информацию, а если чего-то нет, сообщу вам об этом."
+        "Привет! Я Алина, эксперт по теплоснабжению и юридическим вопросам в этой области. Задавай вопрос, и я постараюсь помочь — используя нормативные документы, технические правила и открытую информацию."
     )
     await message.answer(welcome_text)
 
     user_id = message.from_user.id
     user_context[user_id] = [
         {"role": "system", "content": SYSTEM_PROMPT}
-    ]  # Начинаем контекст с system_prompt
-
-    user_info = f"{message.from_user.full_name} (@{message.from_user.username})" if message.from_user.username else message.from_user.full_name
-    await send_log_to_telegram(user_info, "/start", welcome_text)
+    ]
 
 @router.message(F.text)
 async def handle_query(message: Message) -> None:
     user_id = message.from_user.id
     user_text = message.text.strip()
-    user_info = (f"{message.from_user.full_name} (@{message.from_user.username})"
-                 if message.from_user.username else message.from_user.full_name)
+    normalized_text = normalize_query(user_text)
+    inferred_text = infer_document_name_from_context(normalized_text)
 
-    # Если контекста нет (бот перезагрузился), создаём заново
     if user_id not in user_context:
         user_context[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Сохраняем сообщение пользователя в контексте
-    user_context[user_id].append({"role": "user", "content": user_text})
+    user_context[user_id].append({"role": "user", "content": inferred_text})
 
-    # 1) Проверяем, не "судеб" + "практик" ли запрос
-    if "судеб" in user_text.lower() and "практик" in user_text.lower():
-        # Ищем в интернете (Google) по самой фразе пользователя
+    if "судеб" in inferred_text and "практик" in inferred_text:
         async with ClientSession() as session:
-            result = await search_google(user_text, session)
+            result = await search_google(inferred_text, session)
         if result:
-            # Формируем ответ
             answer_text = (
                 f"По вашему запросу о судебной практике:\n"
                 f"Название: {result['title']}\n"
                 f"Ссылка: {result['link']}\n"
                 f"Описание: {result['excerpt']}"
             )
-            # Добавим это как assistant в контекст
             user_context[user_id].append({"role": "assistant", "content": answer_text})
             await message.answer(answer_text)
-            await send_log_to_telegram(user_info, user_text, answer_text)
-            return
-        else:
-            # Ничего не найдено, попросим OpenAI помочь
-            user_context[user_id].append({"role": "assistant", "content": "Поиск в интернете не дал результатов. Сейчас попробую обобщить информацию."})
-            final_answer = await call_openai_chat(user_context[user_id])
-            user_context[user_id].append({"role": "assistant", "content": final_answer})
-            await message.answer(final_answer)
-            await send_log_to_telegram(user_info, user_text, final_answer)
             return
 
-    # 2) Поиск в локальной базе
-    found_doc = find_in_local_docs(user_text)
+    found_doc = find_in_local_docs(inferred_text)
     if found_doc:
         doc_num, doc_title, snippet = found_doc
         answer_text = (
@@ -201,76 +187,33 @@ async def handle_query(message: Message) -> None:
             f"Документ: {doc_title} ({doc_num})\n"
             f"Выдержка: {snippet}"
         )
-        # Добавляем как assistant
         user_context[user_id].append({"role": "assistant", "content": answer_text})
         await message.answer(answer_text)
-        await send_log_to_telegram(user_info, user_text, answer_text)
         return
 
-    # 3) Если нет в базе, ищем в интернете (Google)
     async with ClientSession() as session:
-        result = await search_google(user_text, session)
+        result = await search_google(inferred_text, session)
 
     if result:
         answer_text = (
-            f"Найдена информация из интернета:\n"
+            f"Найдена информация из открытых источников:\n"
             f"Название: {result['title']}\n"
             f"Ссылка: {result['link']}\n"
             f"Описание: {result['excerpt']}"
         )
         user_context[user_id].append({"role": "assistant", "content": answer_text})
         await message.answer(answer_text)
-        await send_log_to_telegram(user_info, user_text, answer_text)
     else:
-        # 4) Если даже в интернете нет, попробуем задать вопрос OpenAI на основе контекста
         user_context[user_id].append({"role": "assistant", "content": "В интернете не найдено точных результатов. Сейчас уточню у ИИ."})
         final_answer = await call_openai_chat(user_context[user_id])
         user_context[user_id].append({"role": "assistant", "content": final_answer})
         await message.answer(final_answer)
-        await send_log_to_telegram(user_info, user_text, final_answer)
-
-# -----------------------------------------------------------------------------
-# Запуск (webhook, etc.)
-# -----------------------------------------------------------------------------
-async def on_startup(bot: Bot) -> None:
-    if WEBHOOK_URL:
-        webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-        logger.info(f"Устанавливаю вебхук: {webhook_url}")
-        await bot.set_webhook(webhook_url)
-
-        from aiogram import Bot
-        log_bot = Bot(token=LOG_BOT_TOKEN)
-        try:
-            await log_bot.send_message(
-                LOG_CHAT_ID,
-                f"🚀 Бот запущен\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка уведомления при старте: {e}")
-        finally:
-            await log_bot.session.close()
-
-async def on_shutdown(bot: Bot) -> None:
-    logger.info("Бот остановлен")
-    from aiogram import Bot
-    log_bot = Bot(token=LOG_BOT_TOKEN)
-    try:
-        await log_bot.send_message(
-            LOG_CHAT_ID,
-            f"🔴 Бот остановлен\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка уведомления при остановке: {e}")
-    finally:
-        await log_bot.session.close()
-    await bot.session.close()
 
 def main() -> None:
+    load_documents_from_docs_folder("docs")
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     app.router.add_get("/", lambda request: web.Response(text="OK"))
-    app.on_startup.append(lambda app: on_startup(bot))
-    app.on_shutdown.append(lambda app: on_shutdown(bot))
     web.run_app(app, host="0.0.0.0", port=int(PORT))
 
 if __name__ == "__main__":
