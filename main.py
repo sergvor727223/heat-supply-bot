@@ -37,26 +37,10 @@ router = Router()
 dp.include_router(router)
 
 user_context = {}
-
-DOCUMENT_ALIASES = {
-    "жк рф": "Жилищный кодекс Российской Федерации",
-    "жилищный кодекс": "Жилищный кодекс Российской Федерации",
-    "жк": "Жилищный кодекс Российской Федерации",
-    "пп 290": "Постановление Правительства РФ от 03.04.2013 № 290",
-    "постановление 290": "Постановление Правительства РФ от 03.04.2013 № 290",
-    "пп рф 290": "Постановление Правительства РФ от 03.04.2013 № 290",
-    "290": "Постановление Правительства РФ от 03.04.2013 № 290",
-    "постановление 354": "Постановление Правительства РФ от 06.05.2011 № 354",
-    "пп 354": "Постановление Правительства РФ от 06.05.2011 № 354",
-    "354": "Постановление Правительства РФ от 06.05.2011 № 354",
-    "постановление 808": "Постановление Правительства РФ от 13.08.2006 № 808",
-    "пп 808": "Постановление Правительства РФ от 13.08.2006 № 808",
-    "808": "Постановление Правительства РФ от 13.08.2006 № 808",
-    "о приборах учета": "Постановление Правительства РФ от 06.05.2011 № 354",
-    "об оплате отопления": "Постановление Правительства РФ от 06.05.2011 № 354"
-}
+user_pending_confirmation = {}  # добавили флаг ожидания подтверждения
 
 DOCS_DB = {}
+
 
 def load_documents_from_docs_folder(folder_path="docs"):
     for filename in os.listdir(folder_path):
@@ -73,29 +57,17 @@ def load_documents_from_docs_folder(folder_path="docs"):
                 logger.warning(f"Ошибка при чтении {filename}: {e}")
 
 
-def normalize_query(query: str) -> str:
-    q = query.lower()
-    for alias, full_name in DOCUMENT_ALIASES.items():
-        if alias in q:
-            q = q.replace(alias, full_name)
-    return q
-
-def infer_document_name_from_context(text: str) -> str:
-    if re.search(r'оплата.*отоплен', text, re.IGNORECASE):
-        return "Постановление Правительства РФ от 06.05.2011 № 354"
-    if re.search(r'прибор.*учета', text, re.IGNORECASE):
-        return "Постановление Правительства РФ от 06.05.2011 № 354"
-    if re.search(r'ответственность.*управляющей|жк', text, re.IGNORECASE):
-        return "Жилищный кодекс Российской Федерации"
-    return text
-
-def find_in_local_docs(query: str):
-    query_lower = query.lower()
-    for doc_number, doc_data in DOCS_DB.items():
-        if (query_lower in doc_data["text"].lower()) or (query_lower in doc_data["title"].lower()):
-            snippet = doc_data["text"][:300] + "..."
-            return (doc_number, doc_data["title"], snippet)
+def search_doc_by_number_or_name(query: str):
+    query = query.lower()
+    for filename, data in DOCS_DB.items():
+        title_lower = data['title'].lower()
+        if query in title_lower:
+            return filename, data['title'], data['text'][:300] + "..."
+        match = re.search(r'\d{3,4}', query)
+        if match and match.group() in title_lower:
+            return filename, data['title'], data['text'][:300] + "..."
     return None
+
 
 async def search_google(query: str, session: ClientSession):
     google_url = "https://www.google.com/search"
@@ -129,17 +101,6 @@ async def search_google(query: str, session: ClientSession):
         logger.error(f"Ошибка при поиске в Google: {e}")
         return None
 
-async def call_openai_chat(context_messages):
-    try:
-        response = await openai.ChatCompletion.acreate(
-            model="gpt-3.5-turbo",
-            messages=context_messages,
-            max_tokens=1000
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Ошибка при обращении к OpenAI: {e}")
-        return "Извините, произошла ошибка при генерации ответа."
 
 @router.message(CommandStart())
 async def command_start(message: Message) -> None:
@@ -147,67 +108,54 @@ async def command_start(message: Message) -> None:
         "Привет! Я Алина, эксперт по теплоснабжению и юридическим вопросам в этой области. Задавай вопрос, и я постараюсь помочь — используя нормативные документы, технические правила и открытую информацию."
     )
     await message.answer(welcome_text)
-
     user_id = message.from_user.id
-    user_context[user_id] = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ]
+    user_context[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
 
 @router.message(F.text)
 async def handle_query(message: Message) -> None:
     user_id = message.from_user.id
-    user_text = message.text.strip()
-    normalized_text = normalize_query(user_text)
-    inferred_text = infer_document_name_from_context(normalized_text)
+    user_text = message.text.strip().lower()
 
-    if user_id not in user_context:
-        user_context[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    user_context[user_id].append({"role": "user", "content": inferred_text})
-
-    if "судеб" in inferred_text and "практик" in inferred_text:
-        async with ClientSession() as session:
-            result = await search_google(inferred_text, session)
-        if result:
-            answer_text = (
-                f"По вашему запросу о судебной практике:\n"
-                f"Название: {result['title']}\n"
-                f"Ссылка: {result['link']}\n"
-                f"Описание: {result['excerpt']}"
-            )
-            user_context[user_id].append({"role": "assistant", "content": answer_text})
-            await message.answer(answer_text)
+    # Обработка подтверждения документа
+    if user_id in user_pending_confirmation:
+        confirmed_title = user_pending_confirmation[user_id]
+        if "да" in user_text:
+            matched_doc = DOCS_DB.get(confirmed_title)
+            if matched_doc:
+                snippet = matched_doc['text'][:500] + "..."
+                await message.answer(f"Вот выдержка из документа «{matched_doc['title']}»:\n{snippet}")
+            else:
+                await message.answer("Документ больше не найден. Пожалуйста, уточните название.")
+            del user_pending_confirmation[user_id]
+            return
+        elif "нет" in user_text:
+            await message.answer("Попробуйте уточнить название документа или его номер.")
+            del user_pending_confirmation[user_id]
             return
 
-    found_doc = find_in_local_docs(inferred_text)
-    if found_doc:
-        doc_num, doc_title, snippet = found_doc
-        answer_text = (
-            f"Найден документ в локальной базе:\n"
-            f"Документ: {doc_title} ({doc_num})\n"
-            f"Выдержка: {snippet}"
-        )
-        user_context[user_id].append({"role": "assistant", "content": answer_text})
-        await message.answer(answer_text)
+    # Основная логика: сначала ищем в локальных документах
+    local_result = search_doc_by_number_or_name(user_text)
+    if local_result:
+        doc_filename, doc_title, snippet = local_result
+        user_pending_confirmation[user_id] = doc_filename
+        await message.answer(f"Вы имели в виду документ: «{doc_title}»? (да/нет)")
         return
 
+    # Если не нашли — просим уточнить
+    await message.answer("Не удалось найти документ в локальной базе. Можете дать более точное название?")
+
+    # Если пользователь настаивает — ищем в интернете
     async with ClientSession() as session:
-        result = await search_google(inferred_text, session)
+        result = await search_google(user_text, session)
 
     if result:
-        answer_text = (
-            f"Найдена информация из открытых источников:\n"
-            f"Название: {result['title']}\n"
-            f"Ссылка: {result['link']}\n"
-            f"Описание: {result['excerpt']}"
+        await message.answer(
+            f"Вот, что удалось найти в открытых источниках:\nНазвание: {result['title']}\nСсылка: {result['link']}\nОписание: {result['excerpt']}"
         )
-        user_context[user_id].append({"role": "assistant", "content": answer_text})
-        await message.answer(answer_text)
     else:
-        user_context[user_id].append({"role": "assistant", "content": "В интернете не найдено точных результатов. Сейчас уточню у ИИ."})
-        final_answer = await call_openai_chat(user_context[user_id])
-        user_context[user_id].append({"role": "assistant", "content": final_answer})
-        await message.answer(final_answer)
+        await message.answer("Ничего не удалось найти в интернете. Пожалуйста, уточните запрос.")
+
 
 def main() -> None:
     load_documents_from_docs_folder("docs")
@@ -215,6 +163,7 @@ def main() -> None:
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     app.router.add_get("/", lambda request: web.Response(text="OK"))
     web.run_app(app, host="0.0.0.0", port=int(PORT))
+
 
 if __name__ == "__main__":
     main()
