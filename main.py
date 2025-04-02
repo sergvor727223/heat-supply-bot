@@ -105,7 +105,7 @@ async def search_google(query: str, session: ClientSession):
 @router.message(CommandStart())
 async def command_start(message: Message) -> None:
     welcome_text = (
-        "Привет! Я Алина, эксперт по теплоснабжению и юридическим вопросам в этой области. Задавай вопрос, и я постараюсь помочь — используя нормативные документы, технические правила и открытую информацию."
+        "Привет! Я Пётр, эксперт по теплоснабжению и юридическим вопросам в этой области. Задавай вопрос, и я постараюсь помочь — используя нормативные документы, технические правила и открытую информацию."
     )
     await message.answer(welcome_text)
     user_id = message.from_user.id
