@@ -1,4 +1,3 @@
-
 import os
 import logging
 import openai
@@ -90,9 +89,7 @@ async def handle_message(message: Message):
     if context.get("selected_document"):
         document_text = documents.get(context["selected_document"], "")
         prompt = f"""Документ:
-
 {document_text[:3000]}
-
 
 Вопрос пользователя: {text}
 
