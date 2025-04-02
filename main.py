@@ -1,126 +1,122 @@
-import logging
-import asyncio
-from datetime import datetime
-import os
 
+import os
+import logging
 import openai
-from aiogram import Bot, Dispatcher, Router, types, F
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram import Bot, Dispatcher, types
 from aiogram.types import Message
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-from aiohttp import web, ClientSession
-from bs4 import BeautifulSoup
-import re
+from aiogram.utils.executor import start_webhook
+from config import TELEGRAM_TOKEN, OPENAI_API_KEY, WEBHOOK_URL
+import difflib
 from docx import Document
 
-from config import (
-    TELEGRAM_TOKEN,
-    OPENAI_API_KEY,
-    WEBHOOK_URL,
-    LOG_BOT_TOKEN,
-    LOG_CHAT_ID,
-    WEBHOOK_PATH,
-    PORT
-)
-
-from system_prompt import SYSTEM_PROMPT
-
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
+# Инициализация бота и диспетчера
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher(bot)
 openai.api_key = OPENAI_API_KEY
 
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
+# Загрузка документов
+DOCS_DIR = "docs"
+documents = {}
+for filename in os.listdir(DOCS_DIR):
+    if filename.endswith(".docx"):
+        filepath = os.path.join(DOCS_DIR, filename)
+        try:
+            doc = Document(filepath)
+            full_text = "\n".join([para.text for para in doc.paragraphs])
+            documents[filename] = full_text
+            logging.info(f"Загружен документ: {filename}")
+        except Exception as e:
+            logging.error(f"Ошибка при загрузке {filename}: {e}")
 
+# Контексты пользователей
 user_context = {}
 
-DOCUMENT_ALIASES = {
-    "жк рф": "Жилищный кодекс Российской Федерации",
-    "жилищный кодекс": "Жилищный кодекс Российской Федерации",
-    "жк": "Жилищный кодекс Российской Федерации",
-    "пп 290": "Постановление Правительства РФ от 03.04.2013 № 290",
-    "290": "ПП_290_минимум_услуг.docx",
-    "пп 354": "ПП_354_комуслуги.docx",
-    "354": "ПП_354_комуслуги.docx",
-    "пп 808": "ПП_808_теплоснабжение.docx",
-    "808": "ПП_808_теплоснабжение.docx"
-}
+# Хелпер: найти наиболее подходящий документ по запросу
+def find_best_match(query):
+    names = list(documents.keys())
+    matches = difflib.get_close_matches(query, names, n=1, cutoff=0.3)
+    return matches[0] if matches else None
 
-DOCS_DB = {}
+# Хелпер: вызвать ChatGPT
+def ask_openai(prompt):
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {
+                "role": "system",
+                "content": open("system_prompt.py", encoding="utf-8").read()
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
+    return response["choices"][0]["message"]["content"]
 
-def load_documents_from_docs_folder(folder_path="docs"):
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".docx"):
-            with open(os.path.join(folder_path, filename), "rb") as f:
-                doc = Document(f)
-                text = "\n".join([p.text for p in doc.paragraphs])
-                DOCS_DB[filename] = text
+# Обработка команды /start
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: Message):
+    user_context[message.from_user.id] = {}
+    await message.answer(
+        "Привет! Я Сергей, эксперт по теплоснабжению и юридическим вопросам. Задавай вопрос — я постараюсь найти точный ответ в нормативных документах."
+    )
 
-load_documents_from_docs_folder()
+# Обработка сообщений
+@dp.message_handler()
+async def handle_message(message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
 
-@router.message(CommandStart())
-async def start_handler(msg: Message):
-    user_context[msg.from_user.id] = {"document": None}
-    await msg.answer("Привет! Я Алина, эксперт по теплоснабжению и юридическим вопросам. Задавай вопрос — я постараюсь найти точный ответ в нормативных документах.")
+    context = user_context.setdefault(user_id, {})
 
-@router.message()
-async def query_handler(msg: Message):
-    user_id = msg.from_user.id
-    user_data = user_context.get(user_id, {"document": None})
-    text = msg.text.strip().lower()
-
-    # Подтверждение документа
-    if user_data.get("awaiting_confirmation"):
-        if text in ["да", "да."]:
-            user_data["document"] = user_data["pending_doc"]
-            user_data.pop("awaiting_confirmation")
-            user_data.pop("pending_doc")
-            user_context[user_id] = user_data
-            docname = user_data["document"]
-            snippet = DOCS_DB[docname][:1000]
-            await msg.answer(f"Вот выдержка из документа «{docname}»:\n\n{snippet}\n\nТеперь можете задать вопрос по этому документу.")
+    # Если ожидаем подтверждение выбора документа
+    if context.get("awaiting_confirmation") and context.get("suggested_doc"):
+        if text.lower() in ["да", "да.", "подтверждаю"]:
+            context["selected_document"] = context["suggested_doc"]
+            context["awaiting_confirmation"] = False
+            doc_text = documents[context["selected_document"]][:2000]
+            await message.answer(f"Вот выдержка из документа «{context['selected_document']}»:\n\n{doc_text}")
+            return
         else:
-            await msg.answer("Хорошо, уточните название документа.")
+            await message.answer("Хорошо. Попробуйте указать другое название документа.")
+            context["awaiting_confirmation"] = False
+            return
+
+    # Если документ уже выбран — обрабатываем запрос по содержанию
+    if context.get("selected_document"):
+        document_text = documents.get(context["selected_document"], "")
+        prompt = f"Документ:
+"""
+{document_text[:3000]}
+"""
+
+Вопрос пользователя: {text}
+
+Ответ:"
+        response = ask_openai(prompt)
+        await message.answer(response)
         return
 
-    # Если документ уже выбран — ищем по нему
-    if user_data.get("document"):
-        docname = user_data["document"]
-        doc_text = DOCS_DB.get(docname, "")
-        matches = [p for p in doc_text.split("\n") if text in p.lower()]
-        if matches:
-            await msg.answer("Вот что удалось найти:\n\n" + "\n\n".join(matches[:5]))
-        else:
-            await msg.answer("К сожалению, в этом документе ничего не нашлось. Уточните вопрос.")
-        return
+    # Если нет выбранного документа — пытаемся найти его
+    doc_match = find_best_match(text)
+    if doc_match:
+        context["suggested_doc"] = doc_match
+        context["awaiting_confirmation"] = True
+        await message.answer(f"Вы имели в виду документ: «{doc_match}»? (да/нет)")
+    else:
+        await message.answer("Не удалось найти документ в локальной базе. Можете дать более точное название?")
 
-    # Ищем совпадение по псевдонимам или номеру
-    for alias, doc_file in DOCUMENT_ALIASES.items():
-        if alias in text:
-            if doc_file in DOCS_DB:
-                user_context[user_id] = {
-                    "awaiting_confirmation": True,
-                    "pending_doc": doc_file
-                }
-                await msg.answer(f"Вы имели в виду документ: «{doc_file}»? (да/нет)")
-                return
+# Настройка вебхука
+async def on_startup(dp):
+    await bot.set_webhook(WEBHOOK_URL)
 
-    await msg.answer("Не удалось найти документ в локальной базе. Можете дать более точное название?")
+async def on_shutdown(dp):
+    await bot.delete_webhook()
 
-async def main():
-    app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, port=PORT)
-    await site.start()
-    logger.info(f"Your service is live ✨\nRunning on http://0.0.0.0:{PORT}")
-    while True:
-        await asyncio.sleep(3600)
-
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    from aiogram import executor
+    executor.start_polling(dp, skip_updates=True)
