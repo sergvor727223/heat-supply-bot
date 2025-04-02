@@ -37,7 +37,8 @@ router = Router()
 dp.include_router(router)
 
 user_context = {}
-user_pending_confirmation = {}  # добавили флаг ожидания подтверждения
+user_pending_confirmation = {}
+user_last_document = {}  # Документ, по которому был предыдущий вопрос
 
 DOCS_DB = {}
 
@@ -66,6 +67,16 @@ def search_doc_by_number_or_name(query: str):
         match = re.search(r'\d{3,4}', query)
         if match and match.group() in title_lower:
             return filename, data['title'], data['text'][:300] + "..."
+    return None
+
+
+def search_answer_in_documents(query: str):
+    query = query.lower()
+    for filename, data in DOCS_DB.items():
+        if query in data['text'].lower():
+            snippet_start = data['text'].lower().find(query)
+            snippet = data['text'][snippet_start:snippet_start + 500] + "..."
+            return data['title'], snippet
     return None
 
 
@@ -105,7 +116,7 @@ async def search_google(query: str, session: ClientSession):
 @router.message(CommandStart())
 async def command_start(message: Message) -> None:
     welcome_text = (
-        "Привет! Я Пётр, эксперт по теплоснабжению и юридическим вопросам в этой области. Задавай вопрос, и я постараюсь помочь — используя нормативные документы, технические правила и открытую информацию."
+        "Привет! Я Алина, эксперт по теплоснабжению и юридическим вопросам в этой области. Задавай вопрос, и я постараюсь помочь — используя нормативные документы, технические правила и открытую информацию."
     )
     await message.answer(welcome_text)
     user_id = message.from_user.id
@@ -117,12 +128,13 @@ async def handle_query(message: Message) -> None:
     user_id = message.from_user.id
     user_text = message.text.strip().lower()
 
-    # Обработка подтверждения документа
+    # Обработка подтверждения
     if user_id in user_pending_confirmation:
         confirmed_title = user_pending_confirmation[user_id]
         if "да" in user_text:
             matched_doc = DOCS_DB.get(confirmed_title)
             if matched_doc:
+                user_last_document[user_id] = confirmed_title
                 snippet = matched_doc['text'][:500] + "..."
                 await message.answer(f"Вот выдержка из документа «{matched_doc['title']}»:\n{snippet}")
             else:
@@ -134,7 +146,7 @@ async def handle_query(message: Message) -> None:
             del user_pending_confirmation[user_id]
             return
 
-    # Основная логика: сначала ищем в локальных документах
+    # Поиск документа по названию или номеру
     local_result = search_doc_by_number_or_name(user_text)
     if local_result:
         doc_filename, doc_title, snippet = local_result
@@ -142,10 +154,17 @@ async def handle_query(message: Message) -> None:
         await message.answer(f"Вы имели в виду документ: «{doc_title}»? (да/нет)")
         return
 
-    # Если не нашли — просим уточнить
+    # Попытка найти ответ по содержанию документов
+    answer_result = search_answer_in_documents(user_text)
+    if answer_result:
+        doc_title, snippet = answer_result
+        await message.answer(f"Вот, что удалось найти в документе «{doc_title}»:\n{snippet}")
+        return
+
+    # Просим уточнить запрос
     await message.answer("Не удалось найти документ в локальной базе. Можете дать более точное название?")
 
-    # Если пользователь настаивает — ищем в интернете
+    # Поиск в интернете
     async with ClientSession() as session:
         result = await search_google(user_text, session)
 
