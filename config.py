@@ -34,7 +34,7 @@ if missing_vars:
 
 # Формируем путь для вебхука (если нужно). 
 # Если Telegram шлёт запросы на /bot<Токен>, используем тот же путь
-WEBHOOK_PATH = f"/bot{TELEGRAM_TOKEN}"
+WEBHOOK_PATH = "/webhook"
 
 # Можно добавить любые дополнительные настройки
 # Например, URL-адрес для поиска по ConsultantPlus, и т. д.
